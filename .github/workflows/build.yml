@@ -60,11 +60,16 @@ jobs:
             git clone --branch $env:IMGUI_VERSION --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
           }
 
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          choco install ninja -y --no-progress
+
       - name: Configure CMake
         shell: pwsh
         run: |
           cmake -S . -B build `
-            -G "Visual Studio 17 2022" -A x64 `
+            -G "Ninja" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
@@ -72,7 +77,7 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+          cmake --build build --parallel
 
       - name: Locate build output
         id: find_dll
