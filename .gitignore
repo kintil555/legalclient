@@ -1,0 +1,28 @@
+# Build output
+/build/
+/out/
+*.obj
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# vcpkg
+/vcpkg/
+vcpkg_installed/
+
+# Vendored ImGui (fetched by CI; clone manually for local builds)
+/third_party/imgui/
+
+# IDE
+.vs/
+.vscode/
+*.user
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Configs generated at runtime
+/configs/
