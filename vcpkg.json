@@ -1,7 +1,7 @@
 {
   "name": "bedrock-utility-client",
   "version": "1.0.0",
-  "builtin-baseline": "2024.12.16",
+  "builtin-baseline": "a7eda31dc16994fcaa8587982eb833a8695f1b6f",
   "dependencies": [
     "nlohmann-json",
     "minhook"
