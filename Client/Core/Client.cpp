@@ -3,6 +3,7 @@
 #include "Modules/KeystrokeHUD.h"
 #include "Modules/AutoJumpOnDamage.h"
 #include "Modules/PlayerESP.h"
+#include "Modules/InjectionNotice.h"
 #include "UI/MenuWindow.h"
 #include "Settings/ConfigManager.h"
 #include "Events/EventBus.h"
@@ -17,6 +18,7 @@ void initializeClient() {
     mgr.registerModule<Modules::KeystrokeHUD>();
     mgr.registerModule<Modules::AutoJumpOnDamage>();
     mgr.registerModule<Modules::PlayerESP>();
+    mgr.registerModule<Modules::InjectionNotice>(); // confirms successful inject on-screen
 
     mgr.bindEvents();
     Settings::ConfigManager::get().load("default.json");
