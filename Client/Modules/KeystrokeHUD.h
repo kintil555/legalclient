@@ -1,8 +1,8 @@
 #pragma once
 #include "Module.h"
-#include "../Rendering/Renderer.h"
 #include <array>
 #include <imgui.h>
+#include <Windows.h> // VK_SPACE, VK_LBUTTON, VK_RBUTTON
 
 namespace Client::Modules {
 
