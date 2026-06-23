@@ -8,8 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Resolved via vcpkg manifest mode (see vcpkg.json):
 #   - nlohmann-json
 #   - minhook
-# ImGui is vendored manually (no upstream CMake package) - fetched by CI
-# into third_party/imgui, or clone it yourself locally before building.
+# ImGui is vendored manually - fetched by CI into third_party/imgui,
+# or clone it yourself locally before building.
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(minhook CONFIG REQUIRED)
 
@@ -40,10 +40,16 @@ target_link_libraries(BedrockUtilityClient PRIVATE
     nlohmann_json::nlohmann_json
     minhook::minhook
     d3d11
+    d3dcompiler
     dxgi
 )
 
 target_compile_definitions(BedrockUtilityClient PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+)
+
+# Entry point for the DLL - ensures DllMain is recognized correctly
+set_target_properties(BedrockUtilityClient PROPERTIES
+    LINK_FLAGS "/ENTRY:DllMain"
 )
