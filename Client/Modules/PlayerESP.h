@@ -63,9 +63,16 @@ public:
     }
 
 private:
-    // Supplied by the rendering hook each frame; declared here only as the
-    // accessor this module needs.
-    static Rendering::ViewMatrix getCurrentViewProjection();
+    // Supplied by the rendering hook each frame in a real build (read from
+    // the game's camera/view matrix via the D3D11 hook). Stubbed here as
+    // an identity-ish matrix so the project links and renders nothing
+    // meaningful until that hook is wired up - replace this with the real
+    // matrix capture before using the client in an actual game session.
+    static Rendering::ViewMatrix getCurrentViewProjection() {
+        Rendering::ViewMatrix vp{};
+        vp.m[0] = vp.m[5] = vp.m[10] = vp.m[15] = 1.0f; // identity matrix
+        return vp;
+    }
 
     bool m_showNames = true;
     bool m_showDistance = true;
