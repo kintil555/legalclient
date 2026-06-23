@@ -6,8 +6,14 @@
 
 namespace Client::UI {
 
-// Main client menu. Visibility is toggled by tapping Right SHIFT - this is
-// just a UI show/hide key, it has no gameplay effect on its own.
+// Main client menu.  Visibility is toggled by tapping the L key.
+// This is a UI-only toggle with zero gameplay effect.
+//
+// Why L?  Right Shift was the original design but the key event pipeline
+// was never wired up (InputHook was missing), so the menu was permanently
+// hidden.  L is a comfortable, single-handed key that does not conflict
+// with any vanilla Bedrock keybind.  Change kMenuToggleKey below to
+// remap it to any other virtual-key code.
 class MenuWindow {
 public:
     static MenuWindow& get() {
@@ -15,12 +21,25 @@ public:
         return instance;
     }
 
-    // Call this from the WndProc/raw-input hook for every key event.
+    // Virtual-key code used to show/hide the menu.
+    //   'L'        = 0x4C  (current default)
+    //   VK_RSHIFT  = 0xA1  (original broken binding)
+    //   VK_INSERT  = 0x2D
+    //   VK_HOME    = 0x24
+    static constexpr int kMenuToggleKey = 'L';
+
+    // Called for every key event forwarded by InputHook.
+    // Edge-triggered: fires only on the first key-down transition so
+    // holding L does not rapidly flicker the menu open/closed.
     void onKeyEvent(int vKey, bool isDown) {
-        if (vKey == VK_RSHIFT && isDown && !m_rshiftWasDown) {
+        const bool isToggle = (vKey == kMenuToggleKey);
+
+        // Toggle on the falling edge of key-down (fresh press only).
+        if (isToggle && isDown && !m_toggleKeyWasDown) {
             m_visible = !m_visible;
         }
-        m_rshiftWasDown = (vKey == VK_RSHIFT) ? isDown : m_rshiftWasDown;
+
+        if (isToggle) m_toggleKeyWasDown = isDown;
     }
 
     void render() {
@@ -29,13 +48,13 @@ public:
         ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_FirstUseEver);
         ImGui::Begin("Client Menu", &m_visible);
 
-        ImGui::TextDisabled("Toggle this menu anytime with Right Shift");
+        ImGui::TextDisabled("Press L to toggle this menu");
         ImGui::Separator();
 
         if (ImGui::BeginTabBar("##categories")) {
-            drawCategoryTab("HUD", Modules::Category::HUD);
-            drawCategoryTab("Visual", Modules::Category::Visual);
-            drawCategoryTab("Utility", Modules::Category::Utility);
+            drawCategoryTab("HUD",         Modules::Category::HUD);
+            drawCategoryTab("Visual",      Modules::Category::Visual);
+            drawCategoryTab("Utility",     Modules::Category::Utility);
             drawCategoryTab("Performance", Modules::Category::Performance);
             ImGui::EndTabBar();
         }
@@ -70,8 +89,8 @@ private:
         ImGui::EndTabItem();
     }
 
-    bool m_visible = false;
-    bool m_rshiftWasDown = false;
+    bool m_visible          = false;
+    bool m_toggleKeyWasDown = false;  // tracks held state for edge detection
 };
 
 } // namespace Client::UI
