@@ -49,7 +49,9 @@ target_compile_definitions(BedrockUtilityClient PRIVATE
     NOMINMAX
 )
 
-# Entry point for the DLL - ensures DllMain is recognized correctly
-set_target_properties(BedrockUtilityClient PROPERTIES
-    LINK_FLAGS "/ENTRY:DllMain"
-)
+# ----- JANGAN SET /ENTRY:DllMain -----
+# MSVC DLL otomatis pakai _DllMainCRTStartup sebagai entry point asli.
+# _DllMainCRTStartup init CRT dulu (malloc, memcpy, exceptions, dll)
+# LALU memanggil DllMain kita. Kalau /ENTRY di-override, _DllMainCRTStartup
+# di-skip -> 90+ LNK2019 error untuk semua simbol CRT.
+# Biarkan linker pakai default DLL entry point.
