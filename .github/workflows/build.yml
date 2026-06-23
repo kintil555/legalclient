@@ -1,0 +1,91 @@
+name: Build Client
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMGUI_VERSION: v1.90.9   # pin ImGui version for reproducible builds
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/vcpkg
+            !${{ github.workspace }}/vcpkg/buildtrees
+            !${{ github.workspace }}/vcpkg/packages
+            !${{ github.workspace }}/vcpkg/downloads
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "vcpkg")) {
+            git clone https://github.com/microsoft/vcpkg.git
+          }
+          ./vcpkg/bootstrap-vcpkg.bat
+
+      - name: Install dependencies via vcpkg
+        shell: pwsh
+        run: |
+          ./vcpkg/vcpkg install nlohmann-json:x64-windows minhook:x64-windows
+
+      - name: Fetch ImGui (vendored, not a CMake package)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "third_party/imgui")) {
+            git clone --branch $env:IMGUI_VERSION --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
+          }
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Locate build output
+        id: find_dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path build -Recurse -Filter "*.dll" | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "No .dll produced by build"
+            exit 1
+          }
+          echo "dll_path=$($dll.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BedrockUtilityClient-${{ github.sha }}
+          path: ${{ steps.find_dll.outputs.dll_path }}
+          retention-days: 14
+          if-no-files-found: error
