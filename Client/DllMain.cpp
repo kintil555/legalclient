@@ -4,10 +4,11 @@
 #include <sstream>
 #include "Core/Client.h"
 #include "Hooks/D3DHook.h"
+#include "Hooks/CommandQueueHook.h"
 
 // ============================================================================
-// DllMain.cpp — dengan file logger untuk debug inject
-// Log ditulis ke: %APPDATA%\LegalClient\debug.log
+// DllMain.cpp
+// Log: %APPDATA%\LegalClient\debug.log
 // ============================================================================
 
 namespace {
@@ -20,34 +21,27 @@ std::string getLogPath() {
 }
 
 void ensureDir(const std::string& path) {
-    // Extract directory from path
     auto pos = path.rfind('\\');
-    if (pos != std::string::npos) {
-        std::string dir = path.substr(0, pos);
-        CreateDirectoryA(dir.c_str(), nullptr);
-    }
+    if (pos != std::string::npos)
+        CreateDirectoryA(path.substr(0, pos).c_str(), nullptr);
 }
 
 void log(const std::string& msg) {
     static std::string logPath = getLogPath();
     static bool dirReady = false;
     if (!dirReady) { ensureDir(logPath); dirReady = true; }
-
     std::ofstream f(logPath, std::ios::app);
     if (!f) return;
-
-    // Timestamp sederhana pakai GetTickCount
     std::ostringstream ss;
-    ss << "[+" << GetTickCount() << "ms] " << msg << "\n";
+    ss << "[+" << GetTickCount64() << "ms] " << msg << "\n";
     f << ss.str();
     f.flush();
 }
 
-bool waitForD3D11(DWORD timeoutMs) {
+bool waitForModule(const char* name, DWORD timeoutMs) {
     const DWORD start = GetTickCount();
     while (GetTickCount() - start < timeoutMs) {
-        if (GetModuleHandleA("d3d11.dll") != nullptr)
-            return true;
+        if (GetModuleHandleA(name)) return true;
         Sleep(100);
     }
     return false;
@@ -57,61 +51,79 @@ bool waitForD3D11(DWORD timeoutMs) {
 
 static DWORD WINAPI clientThread(LPVOID) {
     log("=== LegalClient DLL loaded ===");
-    log("clientThread started");
 
-    // Cek apakah d3d11.dll sudah ada (langsung, tanpa tunggu)
-    bool d3dAlready = GetModuleHandleA("d3d11.dll") != nullptr;
-    log(std::string("d3d11.dll saat inject: ") + (d3dAlready ? "SUDAH ada" : "belum ada, tunggu..."));
-
-    if (!waitForD3D11(60000)) {
-        log("FATAL: d3d11.dll tidak muncul dalam 60 detik. Abort.");
-        return 1;
+    // Tunggu d3d11 atau d3d12 muncul (salah satu pasti ada)
+    log("Menunggu DirectX module...");
+    bool hasDX = false;
+    for (int i = 0; i < 600 && !hasDX; ++i) { // max 60 detik
+        hasDX = GetModuleHandleA("d3d11.dll") || GetModuleHandleA("d3d12.dll");
+        if (!hasDX) Sleep(100);
     }
-    log("d3d11.dll confirmed loaded");
+    if (!hasDX) { log("FATAL: tidak ada DX11/DX12 dalam 60 detik."); return 1; }
 
-    Sleep(800);
+    bool hasDX12 = GetModuleHandleA("d3d12.dll") != nullptr;
+    bool hasDX11 = GetModuleHandleA("d3d11.dll") != nullptr;
+    log(std::string("DX12: ") + (hasDX12 ? "ya" : "tidak") +
+        " | DX11: " + (hasDX11 ? "ya" : "tidak"));
+
+    // Grace period agar swapchain game terbentuk
+    Sleep(1500);
     log("Grace period selesai, init client...");
 
+    // Init modules
     Client::Core::initializeClient();
     log("initializeClient() done");
 
-    bool ok = false;
-    for (int i = 0; i < 20 && !ok; ++i) {
-        ok = Client::Hooks::D3DHook::get().install();
+    // Install MinHook dulu (dibutuhkan D3DHook + CommandQueueHook)
+    MH_Initialize();
+    log("MH_Initialize done");
+
+    // Kalau DX12 — install CommandQueueHook lebih dulu
+    // supaya saat D3DHook Present pertama dipanggil, queue sudah siap
+    if (hasDX12) {
+        bool cqOk = Client::Hooks::CommandQueueHook::get().install();
+        log(std::string("CommandQueueHook: ") + (cqOk ? "OK" : "FAILED (mungkin tidak perlu)"));
+    }
+
+    // Install D3DHook (Present hook via kiero)
+    bool hookOk = false;
+    for (int i = 0; i < 30 && !hookOk; ++i) {
+        hookOk = Client::Hooks::D3DHook::get().install();
         std::ostringstream ss;
-        ss << "D3DHook::install() attempt " << (i+1) << ": " << (ok ? "SUCCESS" : "FAILED");
+        ss << "D3DHook attempt " << (i+1) << ": " << (hookOk ? "OK" : "fail");
         log(ss.str());
-        if (!ok) Sleep(500);
+        if (!hookOk) Sleep(300);
     }
 
-    if (!ok) {
-        log("FATAL: D3DHook gagal setelah 20 percobaan.");
-    } else {
-        log("Client fully initialized! Overlay harusnya muncul.");
+    if (!hookOk) {
+        log("FATAL: D3DHook gagal setelah 30 percobaan.");
+        return 1;
     }
 
-    return ok ? 0 : 1;
+    log("D3DHook installed! Overlay harusnya muncul saat frame pertama.");
+    return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hInstance);
-            // Tulis log awal SEBELUM spawn thread agar selalu terekam
             {
-                // Reset log file di setiap inject baru
                 std::string p = getLogPath();
                 ensureDir(p);
                 std::ofstream f(p, std::ios::trunc);
                 f << "=== LegalClient Debug Log ===\n";
                 f << "DLL_PROCESS_ATTACH fired\n";
+                f.flush();
             }
             CloseHandle(CreateThread(nullptr, 0, clientThread, nullptr, 0, nullptr));
             break;
 
         case DLL_PROCESS_DETACH:
-            log("DLL_PROCESS_DETACH — unloading");
+            log("DLL_PROCESS_DETACH");
+            Client::Hooks::CommandQueueHook::get().uninstall();
             Client::Hooks::D3DHook::get().uninstall();
+            MH_Uninitialize();
             Client::Core::shutdownClient();
             break;
     }
