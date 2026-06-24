@@ -19,9 +19,13 @@ namespace Client::Hooks {
 //   2. Call ImGui::NewFrame() -> renderClient() -> ImGui::Render() every frame.
 //   3. Clean up ImGui on uninstall.
 //
-// Usage:
-//   D3DHook::get().install();   // called from worker thread after game window ready
-//   D3DHook::get().uninstall(); // called from DLL_PROCESS_DETACH
+// Catatan GDK (v1.21.120+, 26.31):
+//   - Game jalan sebagai Win32 EXE biasa, bukan UWP container.
+//   - Untuk buat dummy SwapChain, kita butuh HWND yang valid dari game.
+//     GetForegroundWindow() tidak reliable di GDK — game sering belum jadi
+//     foreground window saat DLL diinject. Kita cari HWND game secara aktif.
+//   - SwapChain dummy HARUS pakai HWND game yang actual, bukan sembarang HWND,
+//     karena D3D11 akan validasi window ownership pada beberapa driver.
 
 using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
 
@@ -35,12 +39,22 @@ public:
     bool install() {
         if (m_installed) return true;
 
-        // --- 1. Create dummy D3D11 device to get SwapChain vtable ptr --------
+        // --- 1. Cari HWND game yang valid ----------------------------------------
+        HWND gameWindow = findGameWindow();
+        if (!gameWindow) {
+            // Fallback ke GetForegroundWindow jika enumerasi gagal
+            gameWindow = GetForegroundWindow();
+        }
+        if (!gameWindow) return false;
+
+        // --- 2. Create dummy D3D11 device untuk ambil SwapChain vtable ----------
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferCount        = 1;
         sd.BufferDesc.Format  = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferDesc.Width   = 8;   // minimal size, tidak perlu match resolusi game
+        sd.BufferDesc.Height  = 8;
         sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow       = GetForegroundWindow();
+        sd.OutputWindow       = gameWindow; // HARUS pakai HWND game yang valid!
         sd.SampleDesc.Count   = 1;
         sd.Windowed           = TRUE;
         sd.SwapEffect         = DXGI_SWAP_EFFECT_DISCARD;
@@ -50,10 +64,26 @@ public:
         IDXGISwapChain*      dummyChain  = nullptr;
         D3D_FEATURE_LEVEL    level;
 
+        // Coba beberapa feature level agar kompatibel dengan berbagai GPU/driver
+        constexpr D3D_FEATURE_LEVEL featureLevels[] = {
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0,
+        };
+
         HRESULT hr = D3D11CreateDeviceAndSwapChain(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-            nullptr, 0, D3D11_SDK_VERSION,
+            featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
             &sd, &dummyChain, &dummyDevice, &level, &dummyContext);
+
+        if (FAILED(hr)) {
+            // Hardware gagal (misal: GPU belum ready), coba WARP software renderer
+            hr = D3D11CreateDeviceAndSwapChain(
+                nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                nullptr, 0, D3D11_SDK_VERSION,
+                &sd, &dummyChain, &dummyDevice, &level, &dummyContext);
+        }
 
         if (FAILED(hr)) return false;
 
@@ -65,7 +95,7 @@ public:
         dummyDevice->Release();
         dummyContext->Release();
 
-        // --- 2. Hook Present via MinHook -------------------------------------
+        // --- 3. Hook Present via MinHook -----------------------------------------
         if (MH_Initialize() != MH_OK) return false;
 
         if (MH_CreateHook(presentAddr,
@@ -105,6 +135,40 @@ public:
 
 private:
     D3DHook() = default;
+
+    // Cari HWND game (Minecraft.Windows.exe GDK) yang benar-benar punya
+    // D3D-renderable surface. GDK Minecraft pakai GLFW sebagai windowing
+    // backend, sehingga window class-nya "GLFW30".
+    static HWND findGameWindow() {
+        // Primary: cari class GLFW30 milik proses ini
+        struct Ctx { DWORD pid; HWND result; };
+        Ctx ctx{ GetCurrentProcessId(), nullptr };
+
+        // Pertama coba FindWindowA dengan class GLFW30
+        HWND hwnd = FindWindowA("GLFW30", nullptr);
+        if (hwnd) {
+            // Verify milik proses kita
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == ctx.pid) return hwnd;
+        }
+
+        // Fallback: enumerate semua top-level windows
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(lp);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+            RECT r{}; GetClientRect(h, &r);
+            if ((r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
+                c->result = h;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+
+        return ctx.result;
+    }
 
     void initImGui(IDXGISwapChain* pSwapChain) {
         if (FAILED(pSwapChain->GetDevice(__uuidof(ID3D11Device),

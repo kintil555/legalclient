@@ -5,23 +5,77 @@
 // ============================================================================
 // DllMain.cpp — DLL entry point untuk Bedrock Utility Client
 // ============================================================================
+// Catatan GDK (v1.21.120+, termasuk 26.31):
+//   - Minecraft GDK berjalan sebagai Win32 app biasa (Minecraft.Windows.exe),
+//     BUKAN UWP. Window class-nya adalah "GLFW30" atau child dari
+//     "ApplicationFrameWindow", bukan "Windows.UI.Core.CoreWindow".
+//   - D3D11 device-nya dibuat oleh game setelah rendering thread aktif.
+//     Grace period 600ms sering tidak cukup, terutama di PC lambat.
+//   - Kita harus nunggu sampai D3D11 benar-benar siap sebelum buat dummy
+//     SwapChain, karena D3D11CreateDeviceAndSwapChain butuh HWND yang valid
+//     dan sudah dipunya game.
 
-// Worker thread: install semua hooks setelah game window siap.
+// Cari HWND game yang valid (milik proses ini, visible, punya client area).
+static HWND waitForGameWindow(DWORD timeoutMs) {
+    const DWORD startTime = GetTickCount();
+    while (GetTickCount() - startTime < timeoutMs) {
+        // GDK Minecraft: window class "GLFW30" (sama kayak Java Edition tapi
+        // ini Bedrock GDK - game pake GLFW sebagai windowing library mereka).
+        // Fallback: iterasi semua top-level window milik proses ini.
+        HWND hwnd = FindWindowA("GLFW30", nullptr);
+        if (!hwnd) {
+            // Fallback: cari window yang owned by proses kita, visible,
+            // dan punya area client yang non-zero.
+            struct Ctx { DWORD pid; HWND result; };
+            Ctx ctx{ GetCurrentProcessId(), nullptr };
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                auto* c = reinterpret_cast<Ctx*>(lp);
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
+                RECT r{}; GetClientRect(h, &r);
+                if ((r.right - r.left) > 100 && (r.bottom - r.top) > 100) {
+                    c->result = h;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&ctx));
+            hwnd = ctx.result;
+        }
+        if (hwnd) {
+            // Pastikan window sudah punya client area (sudah dirender oleh game)
+            RECT r{};
+            GetClientRect(hwnd, &r);
+            if (r.right > 0 && r.bottom > 0) return hwnd;
+        }
+        Sleep(150);
+    }
+    return nullptr;
+}
+
+// Worker thread: install semua hooks setelah game window & D3D siap.
 // Dijalankan di thread terpisah agar tidak deadlock DllMain loader lock.
 static DWORD WINAPI clientThread(LPVOID) {
-    // Tunggu sampai game window ada
-    while (!GetForegroundWindow()) {
-        Sleep(100);
-    }
-    Sleep(600); // grace period: pastikan D3D11 device game sudah ready
+    // Tunggu game window valid (timeout 30 detik untuk PC lambat)
+    HWND gameHwnd = waitForGameWindow(30000);
+    if (!gameHwnd) return 1; // game tidak ketemu, abort
+
+    // Tambahan delay: tunggu D3D11 device game selesai diinisialisasi.
+    // GDK butuh lebih lama dari UWP karena ada proses GDK Xbox auth di background.
+    Sleep(1500);
 
     // Setup modules, EventBus subscribers, InputHook (WndProc)
     Client::Core::initializeClient();
 
-    // Install D3D11 Present hook -> ImGui + renderClient() tiap frame
-    Client::Hooks::D3DHook::get().install();
+    // Install D3D11 Present hook dengan retry (penting untuk GDK!)
+    // D3D11CreateDeviceAndSwapChain bisa gagal kalau D3D device game belum siap.
+    bool hookInstalled = false;
+    for (int attempt = 0; attempt < 10 && !hookInstalled; ++attempt) {
+        hookInstalled = Client::Hooks::D3DHook::get().install();
+        if (!hookInstalled) Sleep(500); // tunggu 0.5s sebelum retry
+    }
 
-    return 0;
+    return hookInstalled ? 0 : 1;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID) {
