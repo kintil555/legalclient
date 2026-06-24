@@ -1,31 +1,24 @@
 #pragma once
 #include <Windows.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_4.h>
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
 #include <MinHook.h>
-#include "../Core/Client.h"   // for Client::Core::renderClient()
+#include "../Core/Client.h"
 
-// Forward-declare ImGui Win32 WndProc handler
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace Client::Hooks {
 
-// D3DHook - hooks IDXGISwapChain::Present (vtable index 8) so we can:
-//   1. Initialize ImGui once on the first frame.
-//   2. Call ImGui::NewFrame() -> renderClient() -> ImGui::Render() every frame.
-//   3. Clean up ImGui on uninstall.
+// D3DHook — hooks IDXGISwapChain::Present via vtable.
 //
-// Catatan GDK (v1.21.120+, 26.31):
-//   - Game jalan sebagai Win32 EXE biasa, bukan UWP container.
-//   - Untuk buat dummy SwapChain, kita butuh HWND yang valid dari game.
-//     GetForegroundWindow() tidak reliable di GDK — game sering belum jadi
-//     foreground window saat DLL diinject. Kita cari HWND game secara aktif.
-//   - SwapChain dummy HARUS pakai HWND game yang actual, bukan sembarang HWND,
-//     karena D3D11 akan validasi window ownership pada beberapa driver.
+// Approach: buat window + dummy device SENDIRI (class "LegalClientDummy"),
+// persis seperti yang dilakukan kiero OSS. Tidak butuh HWND game sama sekali
+// untuk mendapat vtable address — Present address sama di semua D3D11 instance.
+// Ini jauh lebih reliable daripada mengandalkan HWND game saat inject.
 
 using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
 
@@ -39,56 +32,70 @@ public:
     bool install() {
         if (m_installed) return true;
 
-        // --- 1. Cari HWND game yang valid ----------------------------------------
-        HWND gameWindow = findGameWindow();
-        if (!gameWindow) {
-            // Fallback ke GetForegroundWindow jika enumerasi gagal
-            gameWindow = GetForegroundWindow();
-        }
-        if (!gameWindow) return false;
+        // --- 1. Buat window dummy independen (tidak butuh HWND game) -----------
+        WNDCLASSEXA wc{};
+        wc.cbSize        = sizeof(wc);
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc   = DefWindowProcA;
+        wc.hInstance     = GetModuleHandleA(nullptr);
+        wc.lpszClassName = "LegalClientDummy";
+        RegisterClassExA(&wc);
 
-        // --- 2. Create dummy D3D11 device untuk ambil SwapChain vtable ----------
+        HWND dummyHwnd = CreateWindowA(
+            wc.lpszClassName, "LegalClient Dummy",
+            WS_OVERLAPPEDWINDOW, 0, 0, 100, 100,
+            nullptr, nullptr, wc.hInstance, nullptr);
+
+        if (!dummyHwnd) {
+            UnregisterClassA(wc.lpszClassName, wc.hInstance);
+            return false;
+        }
+
+        // --- 2. Buat dummy D3D11 device + swapchain untuk ambil vtable ----------
         DXGI_SWAP_CHAIN_DESC sd{};
         sd.BufferCount        = 1;
+        sd.BufferDesc.Width   = 100;
+        sd.BufferDesc.Height  = 100;
         sd.BufferDesc.Format  = DXGI_FORMAT_R8G8B8A8_UNORM;
-        sd.BufferDesc.Width   = 8;   // minimal size, tidak perlu match resolusi game
-        sd.BufferDesc.Height  = 8;
         sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.OutputWindow       = gameWindow; // HARUS pakai HWND game yang valid!
+        sd.OutputWindow       = dummyHwnd;  // window kita sendiri, selalu valid
         sd.SampleDesc.Count   = 1;
         sd.Windowed           = TRUE;
         sd.SwapEffect         = DXGI_SWAP_EFFECT_DISCARD;
+        sd.Flags              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+
+        const D3D_FEATURE_LEVEL featureLevels[] = {
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0,
+        };
 
         ID3D11Device*        dummyDevice  = nullptr;
         ID3D11DeviceContext* dummyContext = nullptr;
         IDXGISwapChain*      dummyChain  = nullptr;
         D3D_FEATURE_LEVEL    level;
 
-        // Coba beberapa feature level agar kompatibel dengan berbagai GPU/driver
-        constexpr D3D_FEATURE_LEVEL featureLevels[] = {
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0,
-        };
-
         HRESULT hr = D3D11CreateDeviceAndSwapChain(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-            featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
-            &sd, &dummyChain, &dummyDevice, &level, &dummyContext);
+            featureLevels, ARRAYSIZE(featureLevels),
+            D3D11_SDK_VERSION, &sd,
+            &dummyChain, &dummyDevice, &level, &dummyContext);
 
         if (FAILED(hr)) {
-            // Hardware gagal (misal: GPU belum ready), coba WARP software renderer
+            // Fallback software renderer (VM / CI)
             hr = D3D11CreateDeviceAndSwapChain(
                 nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
-                nullptr, 0, D3D11_SDK_VERSION,
-                &sd, &dummyChain, &dummyDevice, &level, &dummyContext);
+                nullptr, 0, D3D11_SDK_VERSION, &sd,
+                &dummyChain, &dummyDevice, &level, &dummyContext);
         }
+
+        DestroyWindow(dummyHwnd);
+        UnregisterClassA(wc.lpszClassName, wc.hInstance);
 
         if (FAILED(hr)) return false;
 
-        // vtable[8] = IDXGISwapChain::Present
-        void** vt         = *reinterpret_cast<void***>(dummyChain);
+        // vtable[8] = IDXGISwapChain::Present (sama di DX11 maupun DX12)
+        void** vt          = *reinterpret_cast<void***>(dummyChain);
         void*  presentAddr = vt[8];
 
         dummyChain->Release();
@@ -136,40 +143,6 @@ public:
 private:
     D3DHook() = default;
 
-    // Cari HWND game (Minecraft.Windows.exe GDK) yang benar-benar punya
-    // D3D-renderable surface. GDK Minecraft (1.21.120+) pakai window class
-    // "Bedrock" — bukan "GLFW30", bukan "Windows.UI.Core.CoreWindow".
-    // Referensi: Flarial OSS WindowManager.cpp (FindWindowExW L"Bedrock").
-    static HWND findGameWindow() {
-        const DWORD myPid = GetCurrentProcessId();
-
-        // Primary: cari class "Bedrock" milik proses ini (GDK Minecraft 1.21.120+)
-        HWND wnd = nullptr;
-        while ((wnd = FindWindowExW(nullptr, wnd, L"Bedrock", nullptr))) {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(wnd, &pid);
-            if (pid == myPid) return wnd;
-        }
-
-        // Fallback: enumerate semua top-level windows milik proses kita.
-        struct Ctx { DWORD pid; HWND result; };
-        Ctx ctx{ myPid, nullptr };
-        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-            auto* c = reinterpret_cast<Ctx*>(lp);
-            DWORD pid = 0;
-            GetWindowThreadProcessId(h, &pid);
-            if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
-            RECT r{}; GetClientRect(h, &r);
-            if ((r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
-                c->result = h;
-                return FALSE;
-            }
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&ctx));
-
-        return ctx.result;
-    }
-
     void initImGui(IDXGISwapChain* pSwapChain) {
         if (FAILED(pSwapChain->GetDevice(__uuidof(ID3D11Device),
                    reinterpret_cast<void**>(&m_device))))
@@ -194,7 +167,6 @@ private:
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-        // Dark theme with rounded corners
         ImGui::StyleColorsDark();
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 6.0f;
@@ -219,7 +191,6 @@ private:
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();
 
-            // Drive all client rendering (menu + HUD modules)
             Client::Core::renderClient();
 
             ImGui::Render();
