@@ -7,8 +7,8 @@
 // ============================================================================
 // Catatan GDK (v1.21.120+, termasuk 26.31):
 //   - Minecraft GDK berjalan sebagai Win32 app biasa (Minecraft.Windows.exe),
-//     BUKAN UWP. Window class-nya adalah "GLFW30" atau child dari
-//     "ApplicationFrameWindow", bukan "Windows.UI.Core.CoreWindow".
+//     BUKAN UWP. Window class-nya adalah "Bedrock" (bukan "Windows.UI.Core.CoreWindow"
+//     dan bukan "GLFW30"). Referensi: Flarial OSS WindowManager.cpp.
 //   - D3D11 device-nya dibuat oleh game setelah rendering thread aktif.
 //     Grace period 600ms sering tidak cukup, terutama di PC lambat.
 //   - Kita harus nunggu sampai D3D11 benar-benar siap sebelum buat dummy
@@ -19,10 +19,10 @@
 static HWND waitForGameWindow(DWORD timeoutMs) {
     const DWORD startTime = GetTickCount();
     while (GetTickCount() - startTime < timeoutMs) {
-        // GDK Minecraft: window class "GLFW30" (sama kayak Java Edition tapi
-        // ini Bedrock GDK - game pake GLFW sebagai windowing library mereka).
+        // GDK Minecraft (1.21.120+, 26.31): window class = "Bedrock"
+        // Sumber: Flarial OSS (WindowManager.cpp) menggunakan FindWindowExW dengan L"Bedrock"
         // Fallback: iterasi semua top-level window milik proses ini.
-        HWND hwnd = FindWindowA("GLFW30", nullptr);
+        HWND hwnd = FindWindowExW(nullptr, nullptr, L"Bedrock", nullptr);
         if (!hwnd) {
             // Fallback: cari window yang owned by proses kita, visible,
             // dan punya area client yang non-zero.

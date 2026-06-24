@@ -10,9 +10,9 @@
 //
 // Catatan GDK vs UWP:
 //   - UWP (sebelum v1.21.120): window class = "Windows.UI.Core.CoreWindow"
-//   - GDK (v1.21.120+, termasuk 26.31): game pakai GLFW sebagai windowing
-//     backend. Window class = "GLFW30". Ini BERBEDA dari UWP, dan
-//     FindWindowA("Windows.UI.Core.CoreWindow") akan SELALU GAGAL di GDK.
+//   - GDK (v1.21.120+, termasuk 26.31): window class = "Bedrock" (W).
+//     Referensi: Flarial OSS src/Client/Managers/WindowManager.cpp
+//     menggunakan FindWindowExW(nullptr, nullptr, L"Bedrock", nullptr).
 //
 // Installation:  call InputHook::install() once from initializeClient().
 // Removal:       call InputHook::uninstall() from shutdownClient().
@@ -26,27 +26,25 @@ public:
         return instance;
     }
 
-    // Finds the Minecraft Bedrock (GDK) window and replaces its WndProc
-    // with our hooked procedure. Safe to call more than once.
     bool install() {
         if (m_installed) return true;
 
         HWND hwnd = findGameWindow();
         if (!hwnd) return false;
 
-        m_hwnd        = hwnd;
+        m_hwnd = hwnd;
+        // Pakai SetWindowLongPtrW karena GDK window adalah Unicode window
         m_origWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrA(hwnd, GWLP_WNDPROC,
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                 reinterpret_cast<LONG_PTR>(&InputHook::hookedWndProc)));
 
         m_installed = (m_origWndProc != nullptr);
         return m_installed;
     }
 
-    // Restores the original WndProc. Must be called before the DLL unloads.
     void uninstall() {
         if (!m_installed || !m_hwnd) return;
-        SetWindowLongPtrA(m_hwnd, GWLP_WNDPROC,
+        SetWindowLongPtrW(m_hwnd, GWLP_WNDPROC,
             reinterpret_cast<LONG_PTR>(m_origWndProc));
         m_installed   = false;
         m_hwnd        = nullptr;
@@ -58,40 +56,32 @@ public:
 private:
     InputHook() = default;
 
-    // Cari HWND game yang tepat untuk GDK Minecraft (26.31).
-    // Urutan pencarian:
-    //   1. FindWindowA("GLFW30") — GDK Minecraft 1.21.120+ pakai GLFW
-    //   2. Enumerate top-level windows milik proses ini (fallback universal)
-    // NOTE: "Windows.UI.Core.CoreWindow" adalah class UWP LAMA, JANGAN PAKAI
-    //       untuk GDK karena tidak akan ketemu.
+    // Cari HWND game GDK Minecraft (1.21.120+, 26.31).
+    // Primary: FindWindowExW dengan class L"Bedrock" — persis seperti Flarial OSS.
+    // Fallback: enumerate top-level windows milik proses ini.
     static HWND findGameWindow() {
         const DWORD myPid = GetCurrentProcessId();
 
-        // Coba GLFW30 dulu (primary untuk GDK Minecraft)
-        HWND hwnd = FindWindowA("GLFW30", nullptr);
-        if (hwnd) {
+        // Primary: class "Bedrock" (GDK Minecraft 1.21.120+)
+        HWND wnd = nullptr;
+        while ((wnd = FindWindowExW(nullptr, wnd, L"Bedrock", nullptr))) {
             DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid == myPid) return hwnd;
-            // GLFW30 ada tapi bukan punya proses kita, lanjut ke fallback
+            GetWindowThreadProcessId(wnd, &pid);
+            if (pid == myPid) return wnd;
         }
 
         // Fallback: enumerate semua top-level windows milik proses kita.
-        // Cari yang visible dan punya client area > 200px (bukan tooltip, dll).
         struct Context { DWORD pid; HWND result; };
         Context ctx{ myPid, nullptr };
-
         EnumWindows([](HWND h, LPARAM lp) -> BOOL {
             auto* c = reinterpret_cast<Context*>(lp);
             DWORD pid = 0;
             GetWindowThreadProcessId(h, &pid);
             if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
-
-            RECT r{};
-            GetClientRect(h, &r);
+            RECT r{}; GetClientRect(h, &r);
             if ((r.right - r.left) > 200 && (r.bottom - r.top) > 200) {
                 c->result = h;
-                return FALSE; // stop enumeration, ketemu
+                return FALSE;
             }
             return TRUE;
         }, reinterpret_cast<LPARAM>(&ctx));
@@ -107,15 +97,13 @@ private:
                                           WPARAM wParam, LPARAM lParam) {
         InputHook& self = InputHook::get();
 
-        // Forward ke ImGui dulu agar ImGui bisa handle input di menu.
-        // Fungsi ini ada di imgui_impl_win32.cpp, forward declare manual karena
-        // imgui_impl_win32.h tidak mengekspornya secara langsung.
+        // Forward ke ImGui agar input di menu bekerja.
+        // Forward declare manual karena fungsi ini ada di .cpp, bukan di header.
         extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
             return true;
 
         switch (msg) {
-            // ---- Keyboard ----
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
                 dispatchKey(static_cast<int>(wParam), true);
@@ -124,18 +112,15 @@ private:
             case WM_SYSKEYUP:
                 dispatchKey(static_cast<int>(wParam), false);
                 break;
-
-            // ---- Mouse buttons (KeystrokeHUD needs these) ----
             case WM_LBUTTONDOWN: dispatchKey(VK_LBUTTON, true);  break;
             case WM_LBUTTONUP:   dispatchKey(VK_LBUTTON, false); break;
             case WM_RBUTTONDOWN: dispatchKey(VK_RBUTTON, true);  break;
             case WM_RBUTTONUP:   dispatchKey(VK_RBUTTON, false); break;
-
             default: break;
         }
 
-        // Selalu forward ke original WndProc agar game tetap menerima input.
-        return CallWindowProcA(self.m_origWndProc, hwnd, msg, wParam, lParam);
+        // Selalu forward ke original WndProc (pakai W karena GDK adalah Unicode window)
+        return CallWindowProcW(self.m_origWndProc, hwnd, msg, wParam, lParam);
     }
 
     bool     m_installed   = false;

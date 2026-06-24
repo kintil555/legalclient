@@ -137,23 +137,23 @@ private:
     D3DHook() = default;
 
     // Cari HWND game (Minecraft.Windows.exe GDK) yang benar-benar punya
-    // D3D-renderable surface. GDK Minecraft pakai GLFW sebagai windowing
-    // backend, sehingga window class-nya "GLFW30".
+    // D3D-renderable surface. GDK Minecraft (1.21.120+) pakai window class
+    // "Bedrock" — bukan "GLFW30", bukan "Windows.UI.Core.CoreWindow".
+    // Referensi: Flarial OSS WindowManager.cpp (FindWindowExW L"Bedrock").
     static HWND findGameWindow() {
-        // Primary: cari class GLFW30 milik proses ini
-        struct Ctx { DWORD pid; HWND result; };
-        Ctx ctx{ GetCurrentProcessId(), nullptr };
+        const DWORD myPid = GetCurrentProcessId();
 
-        // Pertama coba FindWindowA dengan class GLFW30
-        HWND hwnd = FindWindowA("GLFW30", nullptr);
-        if (hwnd) {
-            // Verify milik proses kita
+        // Primary: cari class "Bedrock" milik proses ini (GDK Minecraft 1.21.120+)
+        HWND wnd = nullptr;
+        while ((wnd = FindWindowExW(nullptr, wnd, L"Bedrock", nullptr))) {
             DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid == ctx.pid) return hwnd;
+            GetWindowThreadProcessId(wnd, &pid);
+            if (pid == myPid) return wnd;
         }
 
-        // Fallback: enumerate semua top-level windows
+        // Fallback: enumerate semua top-level windows milik proses kita.
+        struct Ctx { DWORD pid; HWND result; };
+        Ctx ctx{ myPid, nullptr };
         EnumWindows([](HWND h, LPARAM lp) -> BOOL {
             auto* c = reinterpret_cast<Ctx*>(lp);
             DWORD pid = 0;
