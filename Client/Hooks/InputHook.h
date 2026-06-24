@@ -107,8 +107,10 @@ private:
                                           WPARAM wParam, LPARAM lParam) {
         InputHook& self = InputHook::get();
 
-        // Forward ke ImGui dulu agar ImGui bisa handle input di menu
-        // (GDK Minecraft bisa pakai WndProc normal, tidak perlu treatment khusus)
+        // Forward ke ImGui dulu agar ImGui bisa handle input di menu.
+        // Fungsi ini ada di imgui_impl_win32.cpp, forward declare manual karena
+        // imgui_impl_win32.h tidak mengekspornya secara langsung.
+        extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
             return true;
 
