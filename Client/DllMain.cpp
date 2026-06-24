@@ -1,18 +1,49 @@
 #include <Windows.h>
+#include <fstream>
+#include <string>
+#include <sstream>
 #include "Core/Client.h"
 #include "Hooks/D3DHook.h"
 
 // ============================================================================
-// DllMain.cpp — DLL entry point untuk Bedrock Utility Client (GDK 26.31)
+// DllMain.cpp — dengan file logger untuk debug inject
+// Log ditulis ke: %APPDATA%\LegalClient\debug.log
 // ============================================================================
-//
-// Strategy:
-//   1. Tunggu d3d11.dll ter-load ke game (poll GetModuleHandleA).
-//      Ini tanda bahwa D3D sudah diinisialisasi game, aman untuk hook.
-//   2. Tidak perlu HWND game — D3DHook buat dummy window sendiri (kiero-style).
-//   3. Retry loop 20x jika D3DHook::install() gagal (jaga-jaga race condition).
 
-static bool waitForD3D11(DWORD timeoutMs) {
+namespace {
+
+std::string getLogPath() {
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0)
+        return "C:\\LegalClient_debug.log";
+    return std::string(appdata) + "\\LegalClient\\debug.log";
+}
+
+void ensureDir(const std::string& path) {
+    // Extract directory from path
+    auto pos = path.rfind('\\');
+    if (pos != std::string::npos) {
+        std::string dir = path.substr(0, pos);
+        CreateDirectoryA(dir.c_str(), nullptr);
+    }
+}
+
+void log(const std::string& msg) {
+    static std::string logPath = getLogPath();
+    static bool dirReady = false;
+    if (!dirReady) { ensureDir(logPath); dirReady = true; }
+
+    std::ofstream f(logPath, std::ios::app);
+    if (!f) return;
+
+    // Timestamp sederhana pakai GetTickCount
+    std::ostringstream ss;
+    ss << "[+" << GetTickCount() << "ms] " << msg << "\n";
+    f << ss.str();
+    f.flush();
+}
+
+bool waitForD3D11(DWORD timeoutMs) {
     const DWORD start = GetTickCount();
     while (GetTickCount() - start < timeoutMs) {
         if (GetModuleHandleA("d3d11.dll") != nullptr)
@@ -22,25 +53,41 @@ static bool waitForD3D11(DWORD timeoutMs) {
     return false;
 }
 
+} // namespace
+
 static DWORD WINAPI clientThread(LPVOID) {
-    // Tunggu d3d11.dll muncul di proses — artinya game sudah init renderer.
-    // Timeout 60 detik untuk PC paling lambat sekalipun.
-    if (!waitForD3D11(60000))
+    log("=== LegalClient DLL loaded ===");
+    log("clientThread started");
+
+    // Cek apakah d3d11.dll sudah ada (langsung, tanpa tunggu)
+    bool d3dAlready = GetModuleHandleA("d3d11.dll") != nullptr;
+    log(std::string("d3d11.dll saat inject: ") + (d3dAlready ? "SUDAH ada" : "belum ada, tunggu..."));
+
+    if (!waitForD3D11(60000)) {
+        log("FATAL: d3d11.dll tidak muncul dalam 60 detik. Abort.");
         return 1;
+    }
+    log("d3d11.dll confirmed loaded");
 
-    // Sedikit grace period setelah D3D11 load agar render thread game siap.
     Sleep(800);
+    log("Grace period selesai, init client...");
 
-    // Setup modules + InputHook
     Client::Core::initializeClient();
+    log("initializeClient() done");
 
-    // Install Present hook. D3DHook buat dummy window sendiri (tidak butuh
-    // HWND game), sehingga tidak ada dependency pada Bedrock window class.
-    // Retry 20x dengan interval 500ms jika masih gagal.
     bool ok = false;
     for (int i = 0; i < 20 && !ok; ++i) {
         ok = Client::Hooks::D3DHook::get().install();
+        std::ostringstream ss;
+        ss << "D3DHook::install() attempt " << (i+1) << ": " << (ok ? "SUCCESS" : "FAILED");
+        log(ss.str());
         if (!ok) Sleep(500);
+    }
+
+    if (!ok) {
+        log("FATAL: D3DHook gagal setelah 20 percobaan.");
+    } else {
+        log("Client fully initialized! Overlay harusnya muncul.");
     }
 
     return ok ? 0 : 1;
@@ -50,10 +97,20 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hInstance);
+            // Tulis log awal SEBELUM spawn thread agar selalu terekam
+            {
+                // Reset log file di setiap inject baru
+                std::string p = getLogPath();
+                ensureDir(p);
+                std::ofstream f(p, std::ios::trunc);
+                f << "=== LegalClient Debug Log ===\n";
+                f << "DLL_PROCESS_ATTACH fired\n";
+            }
             CloseHandle(CreateThread(nullptr, 0, clientThread, nullptr, 0, nullptr));
             break;
 
         case DLL_PROCESS_DETACH:
+            log("DLL_PROCESS_DETACH — unloading");
             Client::Hooks::D3DHook::get().uninstall();
             Client::Core::shutdownClient();
             break;
