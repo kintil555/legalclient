@@ -7,6 +7,7 @@
 #include <imgui_impl_win32.h>
 #include <MinHook.h>
 #include "../Core/Client.h"
+#include "InputHook.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -187,6 +188,10 @@ private:
             self.initImGui(pSwapChain);
 
         if (self.m_imguiReady && self.m_renderTargetView) {
+            // Poll key state setiap frame - primary input method untuk GDK
+            // (WndProc subclass tidak reliable di GDK, GetAsyncKeyState selalu bisa)
+            Client::Hooks::InputHook::get().pollKeys();
+
             ImGui_ImplDX11_NewFrame();
             ImGui_ImplWin32_NewFrame();
             ImGui::NewFrame();

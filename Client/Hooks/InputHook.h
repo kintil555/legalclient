@@ -4,20 +4,30 @@
 #include <imgui_impl_win32.h>
 #include "../Events/EventBus.h"
 
-// InputHook - subclasses the game window's WndProc so every WM_KEYDOWN,
-// WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-// WM_RBUTTONDOWN, dan WM_RBUTTONUP message diforward ke EventBus.
+// InputHook - menangkap key input game via dua metode:
 //
-// Catatan GDK vs UWP:
-//   - UWP (sebelum v1.21.120): window class = "Windows.UI.Core.CoreWindow"
-//   - GDK (v1.21.120+, termasuk 26.31): window class = "Bedrock" (W).
-//     Referensi: Flarial OSS src/Client/Managers/WindowManager.cpp
-//     menggunakan FindWindowExW(nullptr, nullptr, L"Bedrock", nullptr).
+// METODE 1 (primary): GetAsyncKeyState polling setiap frame dari render hook.
+//   Ini JAUH lebih reliable di GDK karena tidak butuh SetWindowLongPtrW.
+//   SetWindowLongPtrW gagal di GDK karena Windows tidak mengizinkan subclassing
+//   window dari thread/DLL yang bukan pemilik window tersebut.
 //
-// Installation:  call InputHook::install() once from initializeClient().
-// Removal:       call InputHook::uninstall() from shutdownClient().
+// METODE 2 (secondary): WndProc subclass, dicoba tetap tapi sebagai fallback.
+//   Kalau berhasil, key event dari WndProc juga masuk EventBus.
+//   Tidak masalah kalau gagal karena polling sudah cukup.
+//
+// Catatan GDK: window class = L"Bedrock" (v1.21.120+, termasuk 26.31).
+// Referensi: Flarial OSS WindowManager.cpp
 
 namespace Client::Hooks {
+
+// Daftar virtual key yang dipantau oleh polling
+static constexpr int kTrackedKeys[] = {
+    'L',         // menu toggle
+    'W', 'A', 'S', 'D',    // WASD untuk KeystrokeHUD
+    VK_SPACE, VK_SHIFT, VK_CONTROL,
+    VK_LBUTTON, VK_RBUTTON,
+    VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT,
+};
 
 class InputHook {
 public:
@@ -29,40 +39,63 @@ public:
     bool install() {
         if (m_installed) return true;
 
+        // Coba WndProc subclass (opsional, boleh gagal)
         HWND hwnd = findGameWindow();
-        if (!hwnd) return false;
+        if (hwnd) {
+            m_hwnd = hwnd;
+            // Pakai SetWindowLongPtrW
+            m_origWndProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                    reinterpret_cast<LONG_PTR>(&InputHook::hookedWndProc)));
+            if (!m_origWndProc) {
+                // Gagal - tidak apa-apa, polling akan handle key input
+                m_hwnd = nullptr;
+            }
+        }
 
-        m_hwnd = hwnd;
-        // Pakai SetWindowLongPtrW karena GDK window adalah Unicode window
-        m_origWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(&InputHook::hookedWndProc)));
+        // Init state polling semua tracked key ke "tidak ditekan"
+        for (int k : kTrackedKeys) m_prevKeyState[k] = false;
 
-        m_installed = (m_origWndProc != nullptr);
-        return m_installed;
+        m_installed = true;
+        return true;
     }
 
     void uninstall() {
-        if (!m_installed || !m_hwnd) return;
-        SetWindowLongPtrW(m_hwnd, GWLP_WNDPROC,
-            reinterpret_cast<LONG_PTR>(m_origWndProc));
-        m_installed   = false;
-        m_hwnd        = nullptr;
-        m_origWndProc = nullptr;
+        if (!m_installed) return;
+        if (m_hwnd && m_origWndProc) {
+            SetWindowLongPtrW(m_hwnd, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(m_origWndProc));
+            m_origWndProc = nullptr;
+            m_hwnd = nullptr;
+        }
+        m_installed = false;
+    }
+
+    // Dipanggil setiap frame dari D3DHook (sebelum ImGui render).
+    // Poll GetAsyncKeyState untuk semua tracked key dan dispatch event
+    // kalau ada perubahan state (edge detection).
+    void pollKeys() {
+        for (int vk : kTrackedKeys) {
+            const bool pressed = (GetAsyncKeyState(vk) & 0x8000) != 0;
+            const bool prev    = m_prevKeyState[vk];
+
+            if (pressed != prev) {
+                Events::EventBus::get().key.dispatch({ vk, pressed });
+                m_prevKeyState[vk] = pressed;
+            }
+        }
     }
 
     [[nodiscard]] bool isInstalled() const { return m_installed; }
+    [[nodiscard]] bool hasWndProcHook() const { return m_hwnd != nullptr; }
 
 private:
     InputHook() = default;
 
-    // Cari HWND game GDK Minecraft (1.21.120+, 26.31).
-    // Primary: FindWindowExW dengan class L"Bedrock" — persis seperti Flarial OSS.
-    // Fallback: enumerate top-level windows milik proses ini.
     static HWND findGameWindow() {
         const DWORD myPid = GetCurrentProcessId();
 
-        // Primary: class "Bedrock" (GDK Minecraft 1.21.120+)
+        // Primary: class "Bedrock" (GDK Minecraft 1.21.120+, 26.31)
         HWND wnd = nullptr;
         while ((wnd = FindWindowExW(nullptr, wnd, L"Bedrock", nullptr))) {
             DWORD pid = 0;
@@ -70,11 +103,11 @@ private:
             if (pid == myPid) return wnd;
         }
 
-        // Fallback: enumerate semua top-level windows milik proses kita.
-        struct Context { DWORD pid; HWND result; };
-        Context ctx{ myPid, nullptr };
+        // Fallback: enumerate visible windows milik proses kita
+        struct Ctx { DWORD pid; HWND result; };
+        Ctx ctx{ myPid, nullptr };
         EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-            auto* c = reinterpret_cast<Context*>(lp);
+            auto* c = reinterpret_cast<Ctx*>(lp);
             DWORD pid = 0;
             GetWindowThreadProcessId(h, &pid);
             if (pid != c->pid || !IsWindowVisible(h)) return TRUE;
@@ -89,43 +122,40 @@ private:
         return ctx.result;
     }
 
-    static void dispatchKey(int vKey, bool isDown) {
-        Events::EventBus::get().key.dispatch({ vKey, isDown });
-    }
-
     static LRESULT CALLBACK hookedWndProc(HWND hwnd, UINT msg,
-                                          WPARAM wParam, LPARAM lParam) {
+                                           WPARAM wParam, LPARAM lParam) {
         InputHook& self = InputHook::get();
 
-        // Forward ke ImGui agar input di menu bekerja.
-        // Forward declare manual karena fungsi ini ada di .cpp, bukan di header.
         extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
             return true;
 
+        // WndProc-based key dispatch (redundan dengan polling, tidak masalah)
         switch (msg) {
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
-                dispatchKey(static_cast<int>(wParam), true);
+                Events::EventBus::get().key.dispatch({
+                    static_cast<int>(wParam), true });
                 break;
             case WM_KEYUP:
             case WM_SYSKEYUP:
-                dispatchKey(static_cast<int>(wParam), false);
+                Events::EventBus::get().key.dispatch({
+                    static_cast<int>(wParam), false });
                 break;
-            case WM_LBUTTONDOWN: dispatchKey(VK_LBUTTON, true);  break;
-            case WM_LBUTTONUP:   dispatchKey(VK_LBUTTON, false); break;
-            case WM_RBUTTONDOWN: dispatchKey(VK_RBUTTON, true);  break;
-            case WM_RBUTTONUP:   dispatchKey(VK_RBUTTON, false); break;
+            case WM_LBUTTONDOWN: Events::EventBus::get().key.dispatch({ VK_LBUTTON, true });  break;
+            case WM_LBUTTONUP:   Events::EventBus::get().key.dispatch({ VK_LBUTTON, false }); break;
+            case WM_RBUTTONDOWN: Events::EventBus::get().key.dispatch({ VK_RBUTTON, true });  break;
+            case WM_RBUTTONUP:   Events::EventBus::get().key.dispatch({ VK_RBUTTON, false }); break;
             default: break;
         }
 
-        // Selalu forward ke original WndProc (pakai W karena GDK adalah Unicode window)
         return CallWindowProcW(self.m_origWndProc, hwnd, msg, wParam, lParam);
     }
 
-    bool     m_installed   = false;
-    HWND     m_hwnd        = nullptr;
-    WNDPROC  m_origWndProc = nullptr;
+    bool    m_installed   = false;
+    HWND    m_hwnd        = nullptr;
+    WNDPROC m_origWndProc = nullptr;
+    bool    m_prevKeyState[256] = {};  // state per key untuk edge detection polling
 };
 
 } // namespace Client::Hooks
